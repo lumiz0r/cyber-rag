@@ -1,0 +1,26 @@
+# Vector database — contains your personal indexed Notion notes
+chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Config (stored at ~/.config/htb-rag/ but excluded here too just in case)
+config.json
+*.local.json
+
+# Claude Code project settings
+.claude/
+
+# Session files
+sessions/
+*.session.json
+
+# Environment / secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
