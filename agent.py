@@ -758,18 +758,30 @@ class CyberAgent:
 
         cred_services = list({c["service"] for c in self.credentials if c.get("service")})
 
+        # Ports from context first; fall back to reading nmap/allPorts from disk
+        ports = ctx.get("ports", "")
+        if not ports and ctx.get("name"):
+            machine_dir = ctx.get("dir") or str(Path(self.work_dir).expanduser() / ctx["name"])
+            allports_file = Path(machine_dir) / "nmap" / "allPorts"
+            if allports_file.exists():
+                from scanner import parse_grepable_ports
+                ports = parse_grepable_ports(str(allports_file))
+                if ports:
+                    self.machine_context["ports"] = ports
+                    self.machine_context.setdefault("dir", machine_dir)
+
         return {
-            "name":         ctx.get("name", ""),
-            "ip":           ctx.get("ip", ""),
-            "os":           ctx.get("os", ""),
-            "difficulty":   ctx.get("difficulty", ""),
-            "ports":        ctx.get("ports", ""),
-            "turns":        turns,
-            "cred_count":   len(self.credentials),
+            "name":          ctx.get("name", ""),
+            "ip":            ctx.get("ip", ""),
+            "os":            ctx.get("os", ""),
+            "difficulty":    ctx.get("difficulty", ""),
+            "ports":         ports,
+            "turns":         turns,
+            "cred_count":    len(self.credentials),
             "cred_services": cred_services,
-            "last_text":    last_text,
-            "tok_in":       self.session_input_tokens,
-            "tok_out":      self.session_output_tokens,
+            "last_text":     last_text,
+            "tok_in":        self.session_input_tokens,
+            "tok_out":       self.session_output_tokens,
         }
 
     def index_session(self) -> bool:

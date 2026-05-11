@@ -306,7 +306,7 @@ def machine_mode(agent: CyberAgent):
     console.print()
     console.print(Panel(
         f"[{C_SUCCESS}]RECON COMPLETE[/{C_SUCCESS}]  ·  [{C_DIM}]explore on your own, ask when stuck[/{C_DIM}]\n"
-        f"[{C_DIM}]Commands:  [bold]creds[/bold]  ·  [bold]hosts[/bold]  ·  "
+        f"[{C_DIM}]Commands:  [bold]creds[/bold]  ·  [bold]hosts[/bold]  ·  [bold]readme[/bold]  ·  "
         f"[bold]img:<path> <msg>[/bold]  ·  [bold]reset[/bold]  ·  [bold]back[/bold][/{C_DIM}]",
         border_style="bright_green",
         padding=(0, 2),
@@ -356,6 +356,28 @@ def machine_mode(agent: CyberAgent):
                     title=f"[{C_PRIMARY}]◈ CREDENTIAL VAULT — {len(agent.credentials)} stored[/{C_PRIMARY}]",
                     border_style="bright_cyan",
                 ))
+            continue
+
+        if raw.lower() == "readme":
+            machine_dir = agent.machine_context.get("dir")
+            if not machine_dir:
+                console.print(f"[{C_WARN}]No machine dir in context — run recon first.[/{C_WARN}]")
+            else:
+                console.print(f"[{C_SECONDARY}]◈ Generating README…[/{C_SECONDARY}]")
+                try:
+                    readme_content = agent.generate_readme()
+                    readme_path = Path(machine_dir).expanduser() / "README.md"
+                    readme_path.write_text(readme_content)
+                    console.print(Panel(
+                        Markdown(readme_content),
+                        title=f"[{C_PRIMARY}]◈ README — {name}[/{C_PRIMARY}]",
+                        border_style="bright_cyan",
+                        padding=(1, 2),
+                    ))
+                    console.print(f"[{C_DIM}]Saved → {readme_path}[/{C_DIM}]")
+                    agent.save_session(session_path)
+                except Exception as exc:
+                    console.print(f"[{C_ERROR}]✗ Failed: {markup_escape(str(exc))}[/{C_ERROR}]")
             continue
 
         if raw.lower() == "hosts":
