@@ -1,12 +1,19 @@
 """
 CYBER-RAG Engine
 ChromaDB vector store + Ollama embeddings (nomic-embed-text)
+Hybrid retrieval: vector similarity + BM25 re-ranking when rank-bm25 is installed.
 """
 import hashlib
 from typing import Any
 
 import chromadb
 import httpx
+
+try:
+    from rank_bm25 import BM25Okapi
+    _HAS_BM25 = True
+except ImportError:
+    _HAS_BM25 = False
 
 
 # ──────────────────────────────────────────────────────────
@@ -107,29 +114,42 @@ class RAGEngine:
             docs.append(chunk)
             metas.append(meta)
 
-        # ChromaDB upsert (add or update)
         self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
         return len(chunks)
 
     def search(self, query: str, n: int = 6) -> list[dict[str, Any]]:
-        """Semantic search. Returns list of result dicts."""
+        """Hybrid search: fetch 2n vector candidates, re-rank with BM25, return top n."""
         total = self._collection.count()
         if total == 0:
             return []
 
-        k = min(n, total)
+        # Fetch more candidates than needed so BM25 can re-rank meaningfully
+        k = min(max(n * 2, 10), total)
         results = self._collection.query(query_texts=[query], n_results=k)
 
-        out: list[dict] = []
+        candidates: list[dict] = []
         for i in range(len(results["ids"][0])):
-            out.append({
-                "id": results["ids"][0][i],
-                "content": results["documents"][0][i],
+            candidates.append({
+                "id":       results["ids"][0][i],
+                "content":  results["documents"][0][i],
                 "metadata": results["metadatas"][0][i],
-                "distance": results["distances"][0][i],
-                "score": round(1 - results["distances"][0][i], 3),
+                "vector_score": round(1 - results["distances"][0][i], 4),
             })
-        return out
+
+        if _HAS_BM25 and len(candidates) > 1:
+            tokenized = [c["content"].lower().split() for c in candidates]
+            bm25 = BM25Okapi(tokenized)
+            bm25_scores = bm25.get_scores(query.lower().split())
+            max_s = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+            for c, s in zip(candidates, bm25_scores):
+                c["bm25_score"] = s / max_s
+                # 60% vector, 40% keyword — vector dominates but exact matches get a boost
+                c["score"] = round(0.6 * c["vector_score"] + 0.4 * c["bm25_score"], 3)
+        else:
+            for c in candidates:
+                c["score"] = c["vector_score"]
+
+        return sorted(candidates, key=lambda x: x["score"], reverse=True)[:n]
 
     def count(self) -> int:
         return self._collection.count()
@@ -140,4 +160,4 @@ class RAGEngine:
         self._collection = self._get_or_create_collection()
 
     def get_stats(self) -> dict:
-        return {"total_chunks": self.count()}
+        return {"total_chunks": self.count(), "bm25": _HAS_BM25}

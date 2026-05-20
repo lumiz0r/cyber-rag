@@ -6,7 +6,7 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 import os
-import readline  # noqa: F401 — enables arrow-key editing in Prompt.ask()
+import readline
 import sys
 import threading
 from pathlib import Path
@@ -24,6 +24,8 @@ from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
+
+_HISTORY_FILE = Path.home() / ".config" / "htb-rag" / "history"
 
 from config import get_config, save_config
 from notion_client import NotionClient
@@ -119,6 +121,8 @@ def on_tool_start(name: str, inp: dict):
         "add_hosts_entry":  "[HOST]",
         "store_credential": "[CRED]",
         "get_credentials":  "[CRED]",
+        "nikto_scan":       "[NIKTO]",
+        "privesc_enum":     "[PRIVESC]",
     }
     icon = icons.get(name, "[???]")
     detail = ""
@@ -156,13 +160,14 @@ def on_tool_end(name: str, result: str):
         console.print(f"    [{C_DIM}]… ({len(lines) - 12} more lines)[/{C_DIM}]")
 
 
-def on_token_usage(call_in: int, call_out: int, total_in: int, total_out: int, cache_read: int = 0, cache_write: int = 0):
-    parts = [f"tokens: {call_in:,} in / {call_out:,} out"]
+def on_token_usage(call_in: int, call_out: int, total_in: int, total_out: int, cache_read: int = 0, cache_write: int = 0, session_cost: float = 0.0):
+    call_cost = call_in * 3e-6 + call_out * 15e-6 + cache_read * 0.3e-6 + cache_write * 3.75e-6
+    parts = [f"tokens: {call_in:,} in / {call_out:,} out  (${call_cost:.4f})"]
     if cache_write:
         parts.append(f"cache write: {cache_write:,}")
     if cache_read:
         parts.append(f"[bold green]cache hit: {cache_read:,}[/bold green]")
-    parts.append(f"session: {total_in:,} in / {total_out:,} out")
+    parts.append(f"session: {total_in:,} in / {total_out:,} out  [bold yellow](~${session_cost:.3f} total)[/bold yellow]")
     console.print(f"  [{C_DIM}]↳ {' │ '.join(parts)}[/{C_DIM}]")
 
 
@@ -173,6 +178,32 @@ def display_response(response: str, title: str = "◈ CYBER-RAG"):
         border_style="bright_magenta",
         padding=(1, 2),
     ))
+
+
+def streamed_chat(agent, message: str, image_path=None, title: str = "◈ CYBER-RAG", **kwargs) -> str:
+    """Call agent.chat with live streaming display. Returns the full response text."""
+    buffer: list[str] = []
+
+    with Live("", console=console, refresh_per_second=15, vertical_overflow="visible") as live:
+        def _stream_cb(chunk: str):
+            buffer.append(chunk)
+            live.update(Markdown("".join(buffer)))
+
+        agent.stream_cb = _stream_cb
+        try:
+            resp = agent.chat(message, image_path=image_path, **kwargs)
+        finally:
+            agent.stream_cb = None
+
+        # Swap streaming text for the formatted panel
+        live.update(Panel(
+            Markdown(resp),
+            title=f"[{C_SECONDARY}]{title}[/{C_SECONDARY}]",
+            border_style="bright_magenta",
+            padding=(1, 2),
+        ))
+
+    return resp
 
 
 def get_image_path(prompt_text: str = "") -> Optional[str]:
@@ -308,7 +339,7 @@ def machine_mode(agent: CyberAgent):
     console.print(Panel(
         f"[{C_SUCCESS}]RECON COMPLETE[/{C_SUCCESS}]  ·  [{C_DIM}]explore on your own, ask when stuck[/{C_DIM}]\n"
         f"[{C_DIM}]Commands:  [bold]creds[/bold]  ·  [bold]hosts[/bold]  ·  [bold]readme[/bold]  ·  "
-        f"[bold]img:<path> <msg>[/bold]  ·  [bold]reset[/bold]  ·  [bold]back[/bold][/{C_DIM}]",
+        f"[bold]think <msg>[/bold]  ·  [bold]img:<path> <msg>[/bold]  ·  [bold]reset[/bold]  ·  [bold]back[/bold][/{C_DIM}]",
         border_style="bright_green",
         padding=(0, 2),
     ))
@@ -398,17 +429,22 @@ def machine_mode(agent: CyberAgent):
                 console.print(f"[{C_ERROR}]Could not read /etc/hosts: {exc}[/{C_ERROR}]")
             continue
 
+        use_thinking = False
+        if raw.lower().startswith("think "):
+            raw = raw[6:].strip()
+            use_thinking = True
+            console.print(f"[{C_WARN}]▶ Extended thinking enabled[/{C_WARN}]")
+
         img, text = get_image_path(raw)
 
         console.print(f"[{C_DIM}]─────────────────────────────────────────[/{C_DIM}]")
         try:
-            resp = agent.chat(text, image_path=img)
+            streamed_chat(agent, text, image_path=img, title=f"◈ {name}", use_thinking=use_thinking)
         except Exception as exc:
             agent.save_session(session_path)
             console.print(f"[{C_ERROR}]✗ Error — session saved → {session_path}[/{C_ERROR}]")
             console.print(f"[{C_DIM}]{markup_escape(str(exc))}[/{C_DIM}]")
             continue
-        display_response(resp, f"◈ {name}")
         agent.save_session(session_path)
 
 
@@ -422,7 +458,7 @@ def query_mode(agent: CyberAgent):
         f"[{C_DIM}]Ask about hacking techniques, your notes, CTF challenges…[/{C_DIM}]",
         border_style="bright_cyan",
     ))
-    console.print(f"[{C_DIM}]Type [bold]back[/bold] to return. Prefix with [bold]img:<path>[/bold] to attach a screenshot.[/{C_DIM}]\n")
+    console.print(f"[{C_DIM}]Commands: [bold]back[/bold]  [bold]reset[/bold]  [bold]think <msg>[/bold]  [bold]img:<path> <msg>[/bold][/{C_DIM}]\n")
 
     while True:
         try:
@@ -438,12 +474,14 @@ def query_mode(agent: CyberAgent):
             console.print(f"[{C_SUCCESS}]✓ Conversation cleared[/{C_SUCCESS}]")
             continue
 
+        use_thinking = False
+        if raw.lower().startswith("think "):
+            raw = raw[6:].strip()
+            use_thinking = True
+            console.print(f"[{C_WARN}]▶ Extended thinking enabled for this response[/{C_WARN}]")
+
         img, text = get_image_path(raw)
-
-        with console.status(f"[{C_SECONDARY}]◈ Processing…[/{C_SECONDARY}]", spinner="bouncingBall"):
-            resp = agent.chat(text, image_path=img)
-
-        display_response(resp)
+        streamed_chat(agent, text, image_path=img, use_thinking=use_thinking)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -597,6 +635,14 @@ def main():
     os.system("clear")
     print_banner()
 
+    # Persistent readline history across sessions
+    _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    readline.set_history_length(500)
+    try:
+        readline.read_history_file(str(_HISTORY_FILE))
+    except FileNotFoundError:
+        pass
+
     # Load config (triggers setup wizard on first run — must run outside any Live/status context)
     config = get_config()
 
@@ -653,6 +699,12 @@ def main():
             except KeyboardInterrupt:
                 console.print(f"[{C_PRIMARY}]>>> DISCONNECTING <<<[/{C_PRIMARY}]")
                 break
+
+    # Save readline history on exit
+    try:
+        readline.write_history_file(str(_HISTORY_FILE))
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

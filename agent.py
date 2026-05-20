@@ -5,7 +5,9 @@ Claude Sonnet with tool use for autonomous pentesting assistance
 import base64
 import json
 import os
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -14,7 +16,7 @@ import anthropic
 from rag_engine import RAGEngine
 from scanner import (
     add_hosts_entry, format_result, htb_recon, is_dangerous,
-    run_command, search_exploit, smb_enum,
+    nikto_scan, privesc_enum, run_command, search_exploit, smb_enum,
     subdomain_enum, udp_scan, web_enum, whatweb,
 )
 
@@ -215,6 +217,39 @@ TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "nikto_scan",
+        "description": (
+            "Run nikto web vulnerability scanner on a URL. Detects outdated software, dangerous headers, "
+            "default files, and known CVEs that feroxbuster/whatweb miss. Run after web_fingerprint "
+            "when the target is a web server."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL (e.g. http://10.10.10.1)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "privesc_enum",
+        "description": (
+            "Upload and run linpeas (Linux) or winPEAS (Windows) on a compromised target via SSH. "
+            "Use this as soon as you have valid SSH credentials to enumerate privilege escalation paths. "
+            "Requires ssh/sshpass and a valid username + password or key."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target":   {"type": "string", "description": "Target IP"},
+                "username": {"type": "string"},
+                "password": {"type": "string", "description": "SSH password (leave empty for key auth)"},
+                "os_type":  {"type": "string", "enum": ["linux", "windows"], "default": "linux"},
+            },
+            "required": ["target", "username"],
+        },
+    },
 ]
 
 
@@ -262,6 +297,9 @@ RULES:
 - After recon, all scan files are in ~/Desktop/Hackthebox/Machines/<machine_name>/nmap/
 - Be specific: always show exact commands, exact file paths
 - When a technique fails, check the knowledge base for alternatives
+- EFFICIENCY: when you need to call multiple independent tools (e.g. web_fingerprint + search_exploit \
+for different services, or rag_search + web_enum), call them ALL in a single response — they will be \
+executed in parallel, cutting total wait time.
 """
 
 GUIDED_SYSTEM_PROMPT = """\
@@ -315,6 +353,7 @@ RULES:
 - Machine workspace: ~/Desktop/Hackthebox/Machines/<machine_name>/
 - Always show exact commands with exact flags in code blocks — ready to copy-paste
 - After Phase 1 recon, you are a MENTOR, not an autonomous agent
+- EFFICIENCY: call multiple independent tools in a single response — they run in parallel.
 """
 
 
@@ -364,11 +403,19 @@ _TOOL_MAX_CHARS: dict[str, int] = {
     "search_exploit":   1000,
     "web_fingerprint":   700,
     "udp_scan":          700,
+    "nikto_scan":       2000,
+    "privesc_enum":     3000,
 }
-_DEFAULT_TOOL_MAX   = 2000
-_HISTORY_KEEP_RECENT  = 3    # keep last N messages of each type uncompressed
+_DEFAULT_TOOL_MAX    = 2000
+_HISTORY_KEEP_RECENT = 3    # keep last N messages of each type uncompressed
 _HISTORY_COMPRESS_TO  = 400  # chars kept per old tool result after compaction
 _ASSISTANT_COMPRESS_TO = 500  # chars kept per old assistant text block after compaction
+
+# Sonnet 4.6 pricing (USD per token)
+_COST_IN       = 3.00  / 1_000_000
+_COST_OUT      = 15.00 / 1_000_000
+_COST_CACHE_RD =  0.30 / 1_000_000
+_COST_CACHE_WR =  3.75 / 1_000_000
 
 
 class CyberAgent:
@@ -400,6 +447,9 @@ class CyberAgent:
         self.session_input_tokens: int = 0
         self.session_output_tokens: int = 0
         self.session_cache_read_tokens: int = 0
+        self.session_cache_write_tokens: int = 0
+        self.session_cost: float = 0.0
+        self.stream_cb: Optional[Callable[[str], None]] = None
 
     # ── Token-saving helpers ───────────────────────────────
 
@@ -504,9 +554,11 @@ class CyberAgent:
             machine_name = inp["machine_name"]
             ip = inp["ip"]
             r = htb_recon(machine_name, ip, self.work_dir)
-            # Store machine dir so run_command uses it as cwd
             self.machine_context["dir"] = r["machine_dir"]
             self.machine_context["ports"] = r["ports"]
+            # Parse structured service data for session state block
+            if r.get("targeted"):
+                self.machine_context["services"] = self._parse_nmap_services(r["targeted"])
             return r["output"]
 
         elif name == "web_enum":
@@ -582,7 +634,37 @@ class CyberAgent:
                 lines.append(f"{c['username']} / {c['secret']} ({c['secret_type']}){svc}{note}")
             return "\n".join(lines)
 
+        elif name == "nikto_scan":
+            result = nikto_scan(inp["url"])
+            return format_result(result)
+
+        elif name == "privesc_enum":
+            result = privesc_enum(
+                inp["target"],
+                inp["username"],
+                password=inp.get("password", ""),
+                os_type=inp.get("os_type", "linux"),
+            )
+            return format_result(result)
+
         return f"Unknown tool: {name}"
+
+    # ── Nmap parsing ───────────────────────────────────────
+
+    @staticmethod
+    def _parse_nmap_services(output: str) -> dict[int, dict]:
+        """Parse nmap -sCV output into {port: {service, version, proto, state}}."""
+        services: dict[int, dict] = {}
+        for line in output.splitlines():
+            m = re.match(r'^(\d+)/(tcp|udp)\s+(\w+)\s+(\S+)\s*(.*)', line)
+            if m:
+                port    = int(m.group(1))
+                proto   = m.group(2)
+                state   = m.group(3)
+                service = m.group(4)
+                version = m.group(5).strip()
+                services[port] = {"service": service, "state": state, "version": version, "proto": proto}
+        return services
 
     # ── System prompt helpers ──────────────────────────────
 
@@ -595,7 +677,13 @@ class CyberAgent:
             "CURRENT SESSION STATE (authoritative — use when history is compressed):",
             f"Machine: {ctx['name']} | IP: {ctx.get('ip', '')} | OS: {ctx.get('os', '')} | Difficulty: {ctx.get('difficulty', '')}",
         ]
-        if ctx.get("ports"):
+        if ctx.get("services"):
+            svc_strs = []
+            for port, info in list(ctx["services"].items())[:12]:
+                v = f" ({info['version']})" if info.get("version") else ""
+                svc_strs.append(f"{port}/{info.get('proto','tcp')} {info.get('service','?')}{v}")
+            lines.append(f"Services: {' | '.join(svc_strs)}")
+        elif ctx.get("ports"):
             lines.append(f"Open ports: {ctx['ports']}")
         if ctx.get("domains"):
             lines.append(f"Discovered domains: {', '.join(ctx['domains'])}")
@@ -620,7 +708,13 @@ class CyberAgent:
 
     # ── Agentic loop ───────────────────────────────────────
 
-    def chat(self, message: str, image_path: Optional[str] = None, max_tokens: int = 4096) -> str:
+    def chat(
+        self,
+        message: str,
+        image_path: Optional[str] = None,
+        max_tokens: int = 4096,
+        use_thinking: bool = False,
+    ) -> str:
         content: list = []
 
         if image_path and os.path.exists(image_path):
@@ -635,23 +729,42 @@ class CyberAgent:
         content.append({"type": "text", "text": message})
         self.history.append({"role": "user", "content": content})
 
+        # Extended thinking: give the model more room to think through complex problems
+        thinking_param = {"type": "enabled", "budget_tokens": 8000} if use_thinking else None
+        # thinking needs extra token headroom so the budget doesn't crowd out the response
+        effective_max = max(max_tokens, 12000) if use_thinking else max_tokens
+
         final = ""
         while True:
             self._compact_history()
 
-            # Cache tool definitions — ephemeral marker on the last tool caches all of them
+            # Cache tool definitions — ephemeral marker on the last entry caches the whole list
             _tools = list(TOOLS)
             _tools[-1] = {**_tools[-1], "cache_control": {"type": "ephemeral"}}
 
+            api_kwargs: dict = dict(
+                model=self._model,
+                max_tokens=effective_max,
+                system=self._build_system_blocks(),
+                tools=_tools,
+                messages=self.history,
+            )
+            if thinking_param:
+                api_kwargs["thinking"] = thinking_param
+
             for attempt in range(5):
                 try:
-                    resp = self._client.messages.create(
-                        model=self._model,
-                        max_tokens=max_tokens,
-                        system=self._build_system_blocks(),
-                        tools=_tools,
-                        messages=self.history,
-                    )
+                    if self.stream_cb and not use_thinking:
+                        # Streaming: yield text chunks as they arrive, get full message at end
+                        with self._client.messages.stream(**api_kwargs) as stream:
+                            for chunk in stream.text_stream:
+                                try:
+                                    self.stream_cb(chunk)
+                                except Exception:
+                                    pass
+                            resp = stream.get_final_message()
+                    else:
+                        resp = self._client.messages.create(**api_kwargs)
                     break
                 except anthropic.RateLimitError:
                     if attempt == 4:
@@ -662,27 +775,51 @@ class CyberAgent:
 
             cache_read  = getattr(resp.usage, "cache_read_input_tokens", 0) or 0
             cache_write = getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
-            self.session_input_tokens  += resp.usage.input_tokens
-            self.session_output_tokens += resp.usage.output_tokens
-            self.session_cache_read_tokens += cache_read
+            self.session_input_tokens       += resp.usage.input_tokens
+            self.session_output_tokens      += resp.usage.output_tokens
+            self.session_cache_read_tokens  += cache_read
+            self.session_cache_write_tokens += cache_write
+            call_cost = (
+                resp.usage.input_tokens  * _COST_IN
+                + resp.usage.output_tokens * _COST_OUT
+                + cache_read  * _COST_CACHE_RD
+                + cache_write * _COST_CACHE_WR
+            )
+            self.session_cost += call_cost
+
             if self.token_cb:
                 self.token_cb(
                     resp.usage.input_tokens, resp.usage.output_tokens,
                     self.session_input_tokens, self.session_output_tokens,
-                    cache_read, cache_write,
+                    cache_read, cache_write, self.session_cost,
                 )
 
             if resp.stop_reason == "tool_use":
                 self.history.append({"role": "assistant", "content": resp.content})
-                tool_results = []
-                for block in resp.content:
-                    if block.type == "tool_use":
-                        output = self._exec_tool(block.name, block.input)
-                        tool_results.append({
+                tool_blocks = [b for b in resp.content if getattr(b, "type", "") == "tool_use"]
+
+                if len(tool_blocks) > 1:
+                    # Execute independent tool calls in parallel
+                    results: dict[str, str] = {}
+                    with ThreadPoolExecutor(max_workers=min(len(tool_blocks), 4)) as ex:
+                        futures = {ex.submit(self._exec_tool, b.name, b.input): b for b in tool_blocks}
+                        for future in as_completed(futures):
+                            b = futures[future]
+                            results[b.id] = future.result()
+                    tool_results = [
+                        {"type": "tool_result", "tool_use_id": b.id, "content": results[b.id]}
+                        for b in tool_blocks
+                    ]
+                else:
+                    tool_results = [
+                        {
                             "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": output,
-                        })
+                            "tool_use_id": b.id,
+                            "content": self._exec_tool(b.name, b.input),
+                        }
+                        for b in tool_blocks
+                    ]
+
                 self.history.append({"role": "user", "content": tool_results})
                 if self.session_save_cb:
                     try:
@@ -692,7 +829,7 @@ class CyberAgent:
                 continue
 
             for block in resp.content:
-                if hasattr(block, "text"):
+                if hasattr(block, "text") and getattr(block, "type", "") == "text":
                     final += block.text
             self.history.append({"role": "assistant", "content": resp.content})
             break
@@ -777,22 +914,63 @@ class CyberAgent:
                 + "Search the knowledge base for relevant techniques and past machines at this difficulty, "
                 "then run htb_recon to start reconnaissance."
             )
-        return self.chat(msg, image_path=screenshot, max_tokens=8192)
+        # Enable extended thinking for Hard/Insane — worth the extra tokens for complex chains
+        use_thinking = difficulty in ("Hard", "Insane")
+        return self.chat(msg, image_path=screenshot, max_tokens=8192, use_thinking=use_thinking)
 
     def generate_readme(self) -> str:
-        name = self.machine_context.get("name", "Machine")
+        """Generate README from structured machine context — no full history needed."""
+        ctx = self.machine_context
+        name = ctx.get("name", "Machine")
+
+        parts: list[str] = []
+        if ctx.get("services"):
+            svc_lines = []
+            for port, info in ctx["services"].items():
+                v = f" — {info['version']}" if info.get("version") else ""
+                svc_lines.append(f"  {port}/{info.get('proto','tcp')} {info.get('service','?')}{v}")
+            parts.append("Open ports & services:\n" + "\n".join(svc_lines))
+        elif ctx.get("ports"):
+            parts.append(f"Open ports: {ctx['ports']}")
+        if ctx.get("domains"):
+            parts.append(f"Discovered domains: {', '.join(ctx['domains'])}")
+        if self.credentials:
+            clines = [f"  {c['username']} / {c['secret']} [{c.get('service','')}]" for c in self.credentials]
+            parts.append("Credentials found:\n" + "\n".join(clines))
+
+        # Include last 2 assistant analysis messages for attack surface context
+        analysis_snippets: list[str] = []
+        for msg in reversed(self.history[-30:]):
+            if msg["role"] != "assistant":
+                continue
+            blocks = msg["content"] if isinstance(msg["content"], list) else [{"type": "text", "text": str(msg["content"])}]
+            for block in blocks:
+                text = block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
+                if text and len(text) > 100 and getattr(block if isinstance(block, dict) else block, "type" if isinstance(block, dict) else "type", block.get("type", "") if isinstance(block, dict) else getattr(block, "type", "")) in ("text", ""):
+                    analysis_snippets.append(text[:1500])
+            if len(analysis_snippets) >= 2:
+                break
+
+        context_str = "\n\n".join(parts)
+        if analysis_snippets:
+            context_str += "\n\nAgent analysis:\n" + "\n---\n".join(analysis_snippets)
+
         prompt = (
-            f"Based on your recon findings above, generate a README.md for the {name} machine folder. "
-            "Output ONLY the raw markdown — no explanation, no code fences. Use these sections:\n"
-            f"# {name}\n"
-            "## Target Info\n"
-            "## Open Ports & Services\n"
-            "## Technologies Identified\n"
-            "## CVEs / Public Exploits\n"
-            "## Attack Surface Summary\n"
-            "Keep it concise and factual."
+            f"Generate a README.md for HTB machine '{name}'. Output ONLY raw markdown, no fences.\n\n"
+            f"Machine data:\n{context_str}\n\n"
+            f"Required sections: # {name} | ## Target Info | ## Open Ports & Services | "
+            f"## Technologies Identified | ## CVEs / Public Exploits | ## Attack Surface Summary\n"
+            f"Be concise and factual."
         )
-        return self.chat(prompt)
+
+        # Direct API call — no tool use, no full conversation history
+        resp = self._client.messages.create(
+            model=self._model,
+            max_tokens=2048,
+            system=[{"type": "text", "text": "Output only the requested markdown document. No explanations."}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text if resp.content else f"# {name}\n\n*README generation failed.*"
 
     def get_resume_summary(self) -> dict:
         """Extract a session summary from local state — no API call."""
@@ -906,6 +1084,8 @@ class CyberAgent:
         self.session_input_tokens = 0
         self.session_output_tokens = 0
         self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
+        self.session_cost = 0.0
 
     # ── Session persistence ────────────────────────────────
 
@@ -936,6 +1116,8 @@ class CyberAgent:
             "session_input_tokens": self.session_input_tokens,
             "session_output_tokens": self.session_output_tokens,
             "session_cache_read_tokens": self.session_cache_read_tokens,
+            "session_cache_write_tokens": self.session_cache_write_tokens,
+            "session_cost": self.session_cost,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -947,9 +1129,11 @@ class CyberAgent:
             self.history = data["history"]
             self.machine_context = data["machine_context"]
             self.credentials = data.get("credentials", [])
-            self.session_input_tokens = data.get("session_input_tokens", 0)
-            self.session_output_tokens = data.get("session_output_tokens", 0)
-            self.session_cache_read_tokens = data.get("session_cache_read_tokens", 0)
+            self.session_input_tokens       = data.get("session_input_tokens", 0)
+            self.session_output_tokens      = data.get("session_output_tokens", 0)
+            self.session_cache_read_tokens  = data.get("session_cache_read_tokens", 0)
+            self.session_cache_write_tokens = data.get("session_cache_write_tokens", 0)
+            self.session_cost               = data.get("session_cost", 0.0)
             return True
         except (FileNotFoundError, KeyError, json.JSONDecodeError):
             return False
