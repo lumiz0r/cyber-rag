@@ -366,8 +366,9 @@ _TOOL_MAX_CHARS: dict[str, int] = {
     "udp_scan":          700,
 }
 _DEFAULT_TOOL_MAX   = 2000
-_HISTORY_KEEP_RECENT = 3    # keep last N tool-result messages uncompressed
-_HISTORY_COMPRESS_TO = 400  # chars kept per old tool result after compaction
+_HISTORY_KEEP_RECENT  = 3    # keep last N messages of each type uncompressed
+_HISTORY_COMPRESS_TO  = 400  # chars kept per old tool result after compaction
+_ASSISTANT_COMPRESS_TO = 500  # chars kept per old assistant text block after compaction
 
 
 class CyberAgent:
@@ -413,7 +414,8 @@ class CyberAgent:
         return result[:half] + f"\n\n[…{omitted:,} chars omitted…]\n\n" + result[-half:]
 
     def _compact_history(self):
-        """Shrink old tool-result messages in-place to reduce context size on long sessions."""
+        """Shrink old tool-result messages and assistant text blocks to reduce context size."""
+        # Compress old tool results
         tool_msg_idx = [
             i for i, m in enumerate(self.history)
             if m["role"] == "user"
@@ -431,6 +433,25 @@ class CyberAgent:
                             "content": content[:_HISTORY_COMPRESS_TO]
                             + f"\n[…{len(content) - _HISTORY_COMPRESS_TO:,} chars — summarised by assistant above]",
                         }
+                new_blocks.append(block)
+            self.history[i] = {**self.history[i], "content": new_blocks}
+
+        # Compress old assistant text blocks — handles both Pydantic objects and dicts
+        asst_msg_idx = [
+            i for i, m in enumerate(self.history)
+            if m["role"] == "assistant"
+            and isinstance(m["content"], list)
+        ]
+        for i in asst_msg_idx[:-_HISTORY_KEEP_RECENT]:
+            new_blocks = []
+            for block in self.history[i]["content"]:
+                btype = block.get("type", "") if isinstance(block, dict) else getattr(block, "type", "")
+                if btype == "text":
+                    text = block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
+                    if len(text) > _ASSISTANT_COMPRESS_TO:
+                        trimmed = (text[:_ASSISTANT_COMPRESS_TO]
+                                   + f"\n[…{len(text) - _ASSISTANT_COMPRESS_TO:,} chars — compressed]")
+                        block = {"type": "text", "text": trimmed}
                 new_blocks.append(block)
             self.history[i] = {**self.history[i], "content": new_blocks}
 
@@ -458,15 +479,15 @@ class CyberAgent:
         machine_dir = self.machine_context.get("dir")
 
         if name == "rag_search":
-            hits = self.rag.search(inp["query"], n=inp.get("n", 3))
+            hits = self.rag.search(inp["query"], n=inp.get("n", 5))
             if not hits:
                 return "No relevant notes found in the knowledge base."
             parts = []
             for h in hits:
                 title = h["metadata"].get("title", "Unknown")
                 chunk = h["content"]
-                if len(chunk) > 600:
-                    chunk = chunk[:600] + "…"
+                if len(chunk) > 800:
+                    chunk = chunk[:800] + "…"
                 parts.append(f"[score={h['score']:.2f}] **{title}**\n{chunk}")
             return "\n\n---\n\n".join(parts)
 
@@ -527,6 +548,9 @@ class CyberAgent:
                 if not self.confirm_cb(preview):
                     return "Skipped — /etc/hosts not modified."
             result = add_hosts_entry(ip, hostnames)
+            # Keep a deduplicated domain list in context for the session state block
+            existing = self.machine_context.get("domains", [])
+            self.machine_context["domains"] = list(dict.fromkeys(existing + hostnames))
             return format_result(result)
 
         elif name == "store_credential":
@@ -560,9 +584,43 @@ class CyberAgent:
 
         return f"Unknown tool: {name}"
 
+    # ── System prompt helpers ──────────────────────────────
+
+    def _session_state_block(self) -> str:
+        """Compact key facts injected as a second system block so they survive history compaction."""
+        ctx = self.machine_context
+        if not ctx.get("name"):
+            return ""
+        lines = [
+            "CURRENT SESSION STATE (authoritative — use when history is compressed):",
+            f"Machine: {ctx['name']} | IP: {ctx.get('ip', '')} | OS: {ctx.get('os', '')} | Difficulty: {ctx.get('difficulty', '')}",
+        ]
+        if ctx.get("ports"):
+            lines.append(f"Open ports: {ctx['ports']}")
+        if ctx.get("domains"):
+            lines.append(f"Discovered domains: {', '.join(ctx['domains'])}")
+        if self.credentials:
+            svc_list = [f"{c['username']}@{c['service']}" for c in self.credentials if c.get("service")]
+            lines.append(
+                f"Credentials: {len(self.credentials)} stored"
+                + (f" ({', '.join(svc_list[:4])})" if svc_list else "")
+            )
+        return "\n".join(lines)
+
+    def _build_system_blocks(self) -> list[dict]:
+        blocks: list[dict] = [{
+            "type": "text",
+            "text": self._active_system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }]
+        state = self._session_state_block()
+        if state:
+            blocks.append({"type": "text", "text": state})
+        return blocks
+
     # ── Agentic loop ───────────────────────────────────────
 
-    def chat(self, message: str, image_path: Optional[str] = None) -> str:
+    def chat(self, message: str, image_path: Optional[str] = None, max_tokens: int = 4096) -> str:
         content: list = []
 
         if image_path and os.path.exists(image_path):
@@ -581,17 +639,17 @@ class CyberAgent:
         while True:
             self._compact_history()
 
+            # Cache tool definitions — ephemeral marker on the last tool caches all of them
+            _tools = list(TOOLS)
+            _tools[-1] = {**_tools[-1], "cache_control": {"type": "ephemeral"}}
+
             for attempt in range(5):
                 try:
                     resp = self._client.messages.create(
                         model=self._model,
-                        max_tokens=8192,
-                        system=[{
-                            "type": "text",
-                            "text": self._active_system_prompt,
-                            "cache_control": {"type": "ephemeral"},
-                        }],
-                        tools=TOOLS,
+                        max_tokens=max_tokens,
+                        system=self._build_system_blocks(),
+                        tools=_tools,
                         messages=self.history,
                     )
                     break
@@ -719,7 +777,7 @@ class CyberAgent:
                 + "Search the knowledge base for relevant techniques and past machines at this difficulty, "
                 "then run htb_recon to start reconnaissance."
             )
-        return self.chat(msg, image_path=screenshot)
+        return self.chat(msg, image_path=screenshot, max_tokens=8192)
 
     def generate_readme(self) -> str:
         name = self.machine_context.get("name", "Machine")

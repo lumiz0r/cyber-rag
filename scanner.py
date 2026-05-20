@@ -240,15 +240,38 @@ def whatweb(url: str) -> dict:
     return run_command(f"whatweb -a 3 {url}", timeout=60)
 
 
+def filter_findings(output: str, command: str = "") -> str:
+    """Strip banner/progress noise from tool output, keeping only finding lines."""
+    lines = output.splitlines()
+
+    if "feroxbuster" in command:
+        # Feroxbuster finding lines: "200  GET  123l  456w  ..."
+        found = [l for l in lines if re.match(r'^\s*\d{3}\s+\w+', l)]
+        return "\n".join(found) if found else output
+
+    if "wfuzz" in command:
+        # Wfuzz result lines: "000001234:   200  87 L  ..."
+        found = [l for l in lines if re.match(r'^\d+:', l.strip())]
+        return "\n".join(found) if found else output
+
+    if "gobuster" in command:
+        # Gobuster finding lines start with "/" or contain "(Status:"
+        found = [l for l in lines if l.strip().startswith("/") or "(Status:" in l]
+        return "\n".join(found) if found else output
+
+    return output
+
+
 def format_result(result: dict, max_chars: int = 4000) -> str:
     """Format a command result for display / AI context."""
+    cmd = result.get("command", "")
     out = result.get("stdout", "").strip()
     err = result.get("stderr", "").strip()
-    combined = out or err or "(no output)"
+    combined = filter_findings(out or err or "(no output)", cmd)
     if len(combined) > max_chars:
         half = max_chars // 2
         combined = combined[:half] + f"\n\n[…{len(combined) - max_chars:,} chars omitted…]\n\n" + combined[-half:]
-    return f"$ {result['command']}\n{combined}"
+    return f"$ {cmd}\n{combined}"
 
 
 # ── Dangerous command detection ────────────────────────────
