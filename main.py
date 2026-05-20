@@ -6,6 +6,7 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 import os
+import readline  # noqa: F401 — enables arrow-key editing in Prompt.ask()
 import sys
 import threading
 from pathlib import Path
