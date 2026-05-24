@@ -9,6 +9,7 @@ import os
 import readline
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +49,9 @@ C_DIM       = "dim white"
 C_WHITE     = "bold white"
 
 console = Console()
+
+# tool name → (start_time, stop_event) — used by the heartbeat threads
+_running_tools: dict[str, tuple[float, threading.Event]] = {}
 
 # ──────────────────────────────────────────────────────────────
 # ASCII banner
@@ -146,10 +150,41 @@ def on_tool_start(name: str, inp: dict):
         detail = f": {inp.get('username', '')} / {inp.get('secret', '')[:20]}… [{inp.get('service', '?')}]"
     console.print(f"\n  [{C_SECONDARY}]{icon} {name}{detail}[/{C_SECONDARY}]")
 
+    # Start a heartbeat thread — prints elapsed time every 15s after an 8s grace period
+    # so fast tools stay silent but long-running ones keep you informed
+    start_time = time.time()
+    stop = threading.Event()
+    _running_tools[name] = (start_time, stop)
+
+    def _heartbeat():
+        if stop.wait(8):        # silent for the first 8 s
+            return
+        interval = 15
+        while True:
+            elapsed = time.time() - start_time
+            mins, secs = divmod(int(elapsed), 60)
+            elapsed_fmt = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+            console.print(f"    [{C_DIM}]⟳  {name} running… {elapsed_fmt}[/{C_DIM}]")
+            if stop.wait(interval):
+                return
+
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
 
 def on_tool_end(name: str, result: str):
+    # Stop the heartbeat and record elapsed time
+    info = _running_tools.pop(name, None)
+    elapsed_str = ""
+    if info:
+        start_time, stop = info
+        stop.set()
+        elapsed = time.time() - start_time
+        mins, secs = divmod(int(elapsed), 60)
+        elapsed_fmt = f"{mins}m {secs:02d}s" if mins else f"{elapsed:.1f}s"
+        elapsed_str = f"  [{C_DIM}]({elapsed_fmt})[/{C_DIM}]"
+
     if not result or not result.strip():
-        console.print(f"    [{C_DIM}]→ (empty result)[/{C_DIM}]")
+        console.print(f"    [{C_DIM}]→ (empty result){elapsed_str}[/{C_DIM}]")
         return
     lines = result.strip().splitlines()
     lines = [l for l in lines if l.strip()]
@@ -158,6 +193,7 @@ def on_tool_end(name: str, result: str):
     console.print(f"[{C_DIM}]{text}[/{C_DIM}]")
     if len(lines) > 12:
         console.print(f"    [{C_DIM}]… ({len(lines) - 12} more lines)[/{C_DIM}]")
+    console.print(f"    [{C_DIM}]✓ done{elapsed_str}[/{C_DIM}]")
 
 
 def on_token_usage(call_in: int, call_out: int, total_in: int, total_out: int, cache_read: int = 0, cache_write: int = 0, session_cost: float = 0.0):
