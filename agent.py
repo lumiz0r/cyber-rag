@@ -805,20 +805,26 @@ class CyberAgent:
                         futures = {ex.submit(self._exec_tool, b.name, b.input): b for b in tool_blocks}
                         for future in as_completed(futures):
                             b = futures[future]
-                            results[b.id] = future.result()
+                            try:
+                                results[b.id] = future.result()
+                            except Exception as exc:
+                                results[b.id] = f"[tool error] {exc}"
                     tool_results = [
                         {"type": "tool_result", "tool_use_id": b.id, "content": results[b.id]}
                         for b in tool_blocks
                     ]
                 else:
-                    tool_results = [
-                        {
+                    tool_results = []
+                    for b in tool_blocks:
+                        try:
+                            content = self._exec_tool(b.name, b.input)
+                        except Exception as exc:
+                            content = f"[tool error] {exc}"
+                        tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": b.id,
-                            "content": self._exec_tool(b.name, b.input),
-                        }
-                        for b in tool_blocks
-                    ]
+                            "content": content,
+                        })
 
                 self.history.append({"role": "user", "content": tool_results})
                 if self.session_save_cb:

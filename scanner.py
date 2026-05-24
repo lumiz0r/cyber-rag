@@ -270,7 +270,7 @@ def privesc_enum(target: str, username: str, password: str = "", os_type: str = 
 def search_exploit(term: str) -> dict:
     if not shutil.which("searchsploit"):
         return {"command": "", "stdout": "searchsploit not installed", "stderr": "", "returncode": -1, "success": False}
-    return run_command(f"searchsploit --color '{term}'", timeout=30)
+    return run_command(f"searchsploit '{term}'", timeout=30)
 
 
 def whatweb(url: str) -> dict:
