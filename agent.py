@@ -18,6 +18,9 @@ from scanner import (
     add_hosts_entry, format_result, htb_recon, is_dangerous,
     nikto_scan, privesc_enum, run_command, search_exploit, smb_enum,
     subdomain_enum, udp_scan, web_enum, whatweb,
+    # RE / pwn
+    analyze_binary, cyclic_pattern, debug_gdb, decompile_func,
+    disassemble, find_gadgets, find_one_gadget, run_r2, trace_binary,
 )
 
 
@@ -252,6 +255,206 @@ TOOLS = [
     },
 ]
 
+# ──────────────────────────────────────────────────────────
+# Binary exploitation / RE tool definitions
+# ──────────────────────────────────────────────────────────
+
+PWN_TOOLS = [
+    {
+        "name": "rag_search",
+        "description": (
+            "Search the personal knowledge base (synced from Notion notes). "
+            "Use this to find relevant RE/pwn techniques, writeups, payloads, and exploit patterns."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to search for"},
+                "n": {"type": "integer", "description": "Number of results (default 5)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "run_command",
+        "description": (
+            "Execute a shell command. Use for manual steps, running exploit scripts, "
+            "compiling, sending payloads, interacting with remote services via pwntools, etc."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to run"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)", "default": 120},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "analyze_binary",
+        "description": (
+            "Full static survey of a binary — always run this first. "
+            "Returns: file type, architecture, protections (PIE/NX/RELRO/canary), "
+            "ELF sections, symbols, dynamic imports, and interesting strings. "
+            "Identifies attack surface before any further analysis."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the binary"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "disassemble",
+        "description": (
+            "Disassemble a function or address range using radare2 (preferred) or objdump. "
+            "target can be a function name (e.g. 'main', 'win', 'vuln') or a hex address."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "binary": {"type": "string", "description": "Path to the binary"},
+                "target": {"type": "string", "description": "Function name or hex address", "default": "main"},
+                "count":  {"type": "integer", "description": "Max instructions to show (default 100)", "default": 100},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "run_r2",
+        "description": (
+            "Execute arbitrary radare2 commands in batch mode against a binary. "
+            "Pass commands as a semicolon-separated string. Examples:\n"
+            "  'aaa; afl' — analyse all, list functions\n"
+            "  'aaa; pdf @ sym.main' — decompile main\n"
+            "  'aaa; axt sym.imp.system' — xrefs to system()\n"
+            "  'aaa; iz' — strings in data sections\n"
+            "  'aaa; ii' — imports"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "binary":   {"type": "string", "description": "Path to the binary"},
+                "commands": {"type": "string", "description": "Semicolon-separated r2 commands"},
+                "timeout":  {"type": "integer", "description": "Timeout seconds (default 60)", "default": 60},
+            },
+            "required": ["binary", "commands"],
+        },
+    },
+    {
+        "name": "find_gadgets",
+        "description": (
+            "Find ROP gadgets using ROPgadget or ropper. "
+            "Use filter_str to narrow results (e.g. 'pop rdi', 'ret', 'pop rsp'). "
+            "Call after confirming NX is enabled and ROP is the path forward."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "binary":     {"type": "string", "description": "Path to binary (or libc)"},
+                "filter_str": {"type": "string", "description": "Grep filter for gadgets (optional)", "default": ""},
+                "tool":       {"type": "string", "enum": ["auto", "ROPgadget", "ropper"], "default": "auto"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "find_one_gadget",
+        "description": (
+            "Find one-gadget (magic gadget) addresses in a libc.so that call execve('/bin/sh'). "
+            "Pass the path to the libc in use. Returns addresses and their constraints."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "libc_path": {"type": "string", "description": "Path to libc.so.6"},
+            },
+            "required": ["libc_path"],
+        },
+    },
+    {
+        "name": "trace_binary",
+        "description": (
+            "Run a binary under ltrace (library calls, e.g. strcmp, malloc) or strace (syscalls). "
+            "Reveals runtime behaviour: what strings are compared, how input is read, etc. "
+            "Provide args if the binary expects command-line arguments."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "binary":  {"type": "string", "description": "Path to binary"},
+                "args":    {"type": "string", "description": "Arguments to pass to binary (optional)", "default": ""},
+                "tool":    {"type": "string", "enum": ["auto", "ltrace", "strace"], "default": "auto"},
+                "timeout": {"type": "integer", "description": "Timeout seconds (default 30)", "default": 30},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "debug_gdb",
+        "description": (
+            "Run GDB in batch mode with a sequence of commands. "
+            "Use this to: find crash offsets, inspect registers/stack, "
+            "find canary values, check memory layout. "
+            "Example commands: 'start; x/40wx $rsp; info registers; backtrace; q'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "binary":   {"type": "string", "description": "Path to binary"},
+                "commands": {"type": "string", "description": "GDB commands (semicolon or newline separated)"},
+                "timeout":  {"type": "integer", "description": "Timeout seconds (default 30)", "default": 30},
+            },
+            "required": ["binary", "commands"],
+        },
+    },
+    {
+        "name": "cyclic_pattern",
+        "description": (
+            "Generate a de Bruijn cyclic pattern (to find buffer overflow offsets) "
+            "or find the offset from a pattern value found in RIP/EIP/RSP. "
+            "To find offset: set find to the hex value seen in the crash register."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "length": {"type": "integer", "description": "Pattern length to generate (default 200)", "default": 200},
+                "find":   {"type": "string", "description": "Hex value to find offset for (e.g. '0x6161616c'). Leave empty to generate.", "default": ""},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "decompile_func",
+        "description": (
+            "Decompile a function to C pseudocode using Ghidra headless analyzer. "
+            "Slower than r2 but produces cleaner output for complex functions. "
+            "Use when r2 disassembly is hard to follow."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "binary":   {"type": "string", "description": "Path to binary"},
+                "function": {"type": "string", "description": "Function name to decompile (default: main)", "default": "main"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "search_exploit",
+        "description": "Search Exploit-DB for public exploits matching a term.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "term": {"type": "string", "description": "Search term"},
+            },
+            "required": ["term"],
+        },
+    },
+]
+
 
 # ──────────────────────────────────────────────────────────
 # System Prompt
@@ -356,6 +559,79 @@ RULES:
 - EFFICIENCY: call multiple independent tools in a single response — they run in parallel.
 """
 
+BINARY_SYSTEM_PROMPT = """\
+You are CYBER-RAG, an elite AI reverse engineering and binary exploitation specialist for CTF and HackTheBox pwn challenges.
+You have access to radare2, GDB (with pwndbg), pwntools, ROPgadget, ropper, one_gadget, checksec, ltrace, strace, and Ghidra.
+
+━━━ MANDATORY WORKFLOW (follow this order) ━━━
+1. analyze_binary — ALWAYS start here. Learn arch, protections, symbols, interesting strings.
+2. Search the knowledge base for relevant techniques matching the binary's protection profile.
+3. run_r2 with 'aaa; afl' to list all functions. Identify: main, win/flag functions, vuln functions.
+4. disassemble key functions (main, any "vuln"/"read"/"get_input" function).
+5. trace_binary — observe runtime behaviour: what libc calls happen, what strings are compared.
+6. Based on findings, identify the vulnerability class:
+   ┌──────────────────────────────────────────────────────────┐
+   │ NO canary + NO PIE         → stack BOF → ret2win or ROP  │
+   │ canary + NO PIE            → leak canary → ret2libc      │
+   │ canary + PIE               → leak PIE base + canary      │
+   │ format string              → %p leak → arbitrary write   │
+   │ heap (malloc/free visible) → tcache/fastbin/UAF/overlap  │
+   │ simple strcmp/strncmp      → sidechannel or ltrace leak  │
+   └──────────────────────────────────────────────────────────┘
+7. For stack BOF:
+   a. cyclic_pattern to find exact offset to RIP/EIP
+   b. debug_gdb to confirm offset and inspect stack layout
+   c. If ret2win: find win() address with r2, craft payload
+   d. If ret2libc/ROP: find_gadgets for 'pop rdi; ret' etc.
+      find_one_gadget if libc is known
+8. decompile_func (Ghidra) when r2 disassembly is ambiguous.
+9. Generate complete pwntools exploit script — show it in a code block.
+10. run_command to test the exploit locally, then adapt for remote.
+
+RESPONSE FORMAT:
+🔬 **BINARY PROFILE** — arch, protections, key functions, vuln class
+💡 **ANALYSIS** — what the code does, where the bug is, why it's exploitable
+📓 **FROM YOUR NOTES** — relevant technique from the knowledge base
+⚡ **EXPLOIT PLAN** — step-by-step with rationale
+🐍 **PWNTOOLS SCRIPT** — complete, runnable exploit code
+🔧 **COMMANDS** — exact shell commands ready to run
+
+PWNTOOLS SCRIPT TEMPLATE (always follow this structure):
+```python
+#!/usr/bin/env python3
+from pwn import *
+
+context.binary = elf = ELF('./binary')
+context.arch   = 'amd64'   # or 'i386'
+# context.log_level = 'debug'
+
+def exploit(io):
+    # ── leak / setup ──
+    # ── payload construction ──
+    # ── trigger ──
+    io.interactive()
+
+# Local
+io = process('./binary')
+# Remote (uncomment when targeting)
+# io = remote('target.htb', 9001)
+exploit(io)
+```
+
+DIFFICULTY-AWARE EXPLOITATION:
+- Easy: No PIE + no canary = ret2win. One gadget. Single step.
+- Medium: Canary or PIE = leak first. ret2libc with system('/bin/sh') or one_gadget.
+- Hard: Full RELRO + PIE + canary = ROP chain, format string leak, or heap primitive.
+- Insane: FSOP, kernel, sandbox escape, custom heap allocator abuse.
+
+RULES:
+- CTF / HackTheBox authorized environments only
+- Always generate a COMPLETE pwntools script, not a fragment
+- Test locally before going remote — show both process() and remote() versions
+- When a gadget or offset is found, embed it directly in the script (no placeholders)
+- EFFICIENCY: run analyze_binary + rag_search in parallel on the first turn
+"""
+
 
 # ──────────────────────────────────────────────────────────
 # Difficulty hints (injected into each machine's first message)
@@ -405,6 +681,16 @@ _TOOL_MAX_CHARS: dict[str, int] = {
     "udp_scan":          700,
     "nikto_scan":       2000,
     "privesc_enum":     3000,
+    # RE / pwn tools
+    "analyze_binary":   3500,
+    "disassemble":      3000,
+    "run_r2":           2500,
+    "find_gadgets":     2000,
+    "find_one_gadget":   800,
+    "trace_binary":     2000,
+    "debug_gdb":        2000,
+    "cyclic_pattern":    500,
+    "decompile_func":   4000,
 }
 _DEFAULT_TOOL_MAX    = 2000
 _HISTORY_KEEP_RECENT = 3    # keep last N messages of each type uncompressed
@@ -443,6 +729,7 @@ class CyberAgent:
         self._active_system_prompt = SYSTEM_PROMPT
         self.history: list[dict] = []
         self.machine_context: dict = {}
+        self.binary_context: dict = {}
         self.credentials: list[dict] = []
         self.session_input_tokens: int = 0
         self.session_output_tokens: int = 0
@@ -647,6 +934,61 @@ class CyberAgent:
             )
             return format_result(result)
 
+        # ── RE / pwn tools ─────────────────────────────────
+        elif name == "analyze_binary":
+            result = analyze_binary(inp["path"])
+            # Cache key facts into binary_context
+            out = result.get("stdout", "")
+            if "x86-64" in out or "x86_64" in out or "ELF 64-bit" in out:
+                self.binary_context["arch"] = "amd64"
+            elif "80386" in out or "ELF 32-bit" in out:
+                self.binary_context["arch"] = "i386"
+            protections = {}
+            if "No RELRO" in out:    protections["RELRO"] = "None"
+            elif "Partial RELRO" in out: protections["RELRO"] = "Partial"
+            elif "Full RELRO" in out:    protections["RELRO"] = "Full"
+            protections["NX"]      = "disabled" not in out.lower() if "NX" in out else "unknown"
+            protections["PIE"]     = "No PIE" not in out if "PIE" in out else "unknown"
+            protections["canary"]  = "No canary" not in out if "canary" in out or "stack_chk" in out else "unknown"
+            self.binary_context["protections"] = protections
+            self.binary_context["path"] = inp["path"]
+            return format_result(result)
+
+        elif name == "disassemble":
+            result = disassemble(inp["binary"], inp.get("target", "main"), inp.get("count", 100))
+            return format_result(result)
+
+        elif name == "run_r2":
+            result = run_r2(inp["binary"], inp["commands"], timeout=inp.get("timeout", 60))
+            return format_result(result)
+
+        elif name == "find_gadgets":
+            result = find_gadgets(inp["binary"], inp.get("filter_str", ""), inp.get("tool", "auto"))
+            return format_result(result)
+
+        elif name == "find_one_gadget":
+            result = find_one_gadget(inp["libc_path"])
+            return format_result(result)
+
+        elif name == "trace_binary":
+            result = trace_binary(
+                inp["binary"], inp.get("args", ""),
+                tool=inp.get("tool", "auto"), timeout=inp.get("timeout", 30),
+            )
+            return format_result(result)
+
+        elif name == "debug_gdb":
+            result = debug_gdb(inp["binary"], inp["commands"], timeout=inp.get("timeout", 30))
+            return format_result(result)
+
+        elif name == "cyclic_pattern":
+            result = cyclic_pattern(inp.get("length", 200), inp.get("find", ""))
+            return format_result(result)
+
+        elif name == "decompile_func":
+            result = decompile_func(inp["binary"], inp.get("function", "main"))
+            return format_result(result)
+
         return f"Unknown tool: {name}"
 
     # ── Nmap parsing ───────────────────────────────────────
@@ -695,15 +1037,43 @@ class CyberAgent:
             )
         return "\n".join(lines)
 
+    def _binary_state_block(self) -> str:
+        """Compact binary context injected as a second system block."""
+        ctx = self.binary_context
+        if not ctx.get("path"):
+            return ""
+        prot = ctx.get("protections", {})
+        prot_str = " | ".join(f"{k}={v}" for k, v in prot.items()) if prot else "unknown"
+        lines = [
+            "CURRENT BINARY SESSION STATE:",
+            f"Binary: {ctx['path']} | Arch: {ctx.get('arch', 'unknown')}",
+            f"Protections: {prot_str}",
+        ]
+        if ctx.get("remote"):
+            host, port = ctx["remote"]
+            lines.append(f"Remote: {host}:{port}")
+        if ctx.get("offset"):
+            lines.append(f"BOF offset to RIP: {ctx['offset']}")
+        if ctx.get("libc"):
+            lines.append(f"libc: {ctx['libc']}")
+        if ctx.get("notes"):
+            lines.append(f"Notes: {ctx['notes']}")
+        return "\n".join(lines)
+
     def _build_system_blocks(self) -> list[dict]:
         blocks: list[dict] = [{
             "type": "text",
             "text": self._active_system_prompt,
             "cache_control": {"type": "ephemeral"},
         }]
+        # Machine mode state block
         state = self._session_state_block()
         if state:
             blocks.append({"type": "text", "text": state})
+        # Binary mode state block
+        bin_state = self._binary_state_block()
+        if bin_state:
+            blocks.append({"type": "text", "text": bin_state})
         return blocks
 
     # ── Agentic loop ───────────────────────────────────────
@@ -738,8 +1108,9 @@ class CyberAgent:
         while True:
             self._compact_history()
 
-            # Cache tool definitions — ephemeral marker on the last entry caches the whole list
-            _tools = list(TOOLS)
+            # Select tool set based on active mode; cache the last entry to cache the whole list
+            _tool_set = PWN_TOOLS if self._active_system_prompt is BINARY_SYSTEM_PROMPT else TOOLS
+            _tools = list(_tool_set)
             _tools[-1] = {**_tools[-1], "cache_control": {"type": "ephemeral"}}
 
             api_kwargs: dict = dict(
@@ -924,6 +1295,54 @@ class CyberAgent:
         use_thinking = difficulty in ("Hard", "Insane")
         return self.chat(msg, image_path=screenshot, max_tokens=8192, use_thinking=use_thinking)
 
+    # ── Binary mode entry point ────────────────────────────
+
+    def start_binary(
+        self,
+        binary_path: str,
+        challenge_name: str = "",
+        remote_host: str = "",
+        remote_port: int = 0,
+        difficulty: str = "Medium",
+        libc_path: str = "",
+        notes: str = "",
+    ) -> str:
+        """Kick off a binary exploitation / RE session."""
+        self._active_system_prompt = BINARY_SYSTEM_PROMPT
+        name = challenge_name or Path(binary_path).name
+        self.binary_context = {
+            "path":   binary_path,
+            "name":   name,
+            "difficulty": difficulty,
+        }
+        if remote_host and remote_port:
+            self.binary_context["remote"] = (remote_host, remote_port)
+        if libc_path:
+            self.binary_context["libc"] = libc_path
+        if notes:
+            self.binary_context["notes"] = notes
+
+        diff_hint = _DIFFICULTY_HINTS.get(difficulty, _DIFFICULTY_HINTS["Medium"])
+
+        remote_str = (
+            f"\nRemote: nc {remote_host} {remote_port}"
+            if remote_host and remote_port else ""
+        )
+        libc_str = f"\nlibc: {libc_path}" if libc_path else ""
+
+        msg = (
+            f"CHALLENGE: {name}\n"
+            f"Binary: {binary_path}{remote_str}{libc_str}\n"
+            f"{diff_hint}\n\n"
+            "Start the analysis:\n"
+            "1. Run analyze_binary AND rag_search (search for relevant pwn techniques) in parallel\n"
+            "2. Then list all functions with r2 (aaa; afl)\n"
+            "3. Follow the mandatory workflow from the system prompt\n"
+            "Identify the vulnerability class and produce a complete exploit."
+        )
+        use_thinking = difficulty in ("Hard", "Insane")
+        return self.chat(msg, max_tokens=8192, use_thinking=use_thinking)
+
     def generate_readme(self) -> str:
         """Generate README from structured machine context — no full history needed."""
         ctx = self.machine_context
@@ -1085,6 +1504,7 @@ class CyberAgent:
     def reset(self):
         self.history = []
         self.machine_context = {}
+        self.binary_context = {}
         self.credentials = []
         self._active_system_prompt = SYSTEM_PROMPT
         self.session_input_tokens = 0
@@ -1117,6 +1537,7 @@ class CyberAgent:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         data = {
             "machine_context": self.machine_context,
+            "binary_context":  self.binary_context,
             "history": self._serialize_history(),
             "credentials": self.credentials,
             "session_input_tokens": self.session_input_tokens,
@@ -1124,6 +1545,11 @@ class CyberAgent:
             "session_cache_read_tokens": self.session_cache_read_tokens,
             "session_cache_write_tokens": self.session_cache_write_tokens,
             "session_cost": self.session_cost,
+            "active_prompt": (
+                "binary" if self._active_system_prompt is BINARY_SYSTEM_PROMPT
+                else "guided" if self._active_system_prompt is GUIDED_SYSTEM_PROMPT
+                else "system"
+            ),
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -1134,12 +1560,21 @@ class CyberAgent:
                 data = json.load(f)
             self.history = data["history"]
             self.machine_context = data["machine_context"]
+            self.binary_context  = data.get("binary_context", {})
             self.credentials = data.get("credentials", [])
             self.session_input_tokens       = data.get("session_input_tokens", 0)
             self.session_output_tokens      = data.get("session_output_tokens", 0)
             self.session_cache_read_tokens  = data.get("session_cache_read_tokens", 0)
             self.session_cache_write_tokens = data.get("session_cache_write_tokens", 0)
             self.session_cost               = data.get("session_cost", 0.0)
+            # Restore the correct system prompt
+            active = data.get("active_prompt", "system")
+            if active == "binary":
+                self._active_system_prompt = BINARY_SYSTEM_PROMPT
+            elif active == "guided":
+                self._active_system_prompt = GUIDED_SYSTEM_PROMPT
+            else:
+                self._active_system_prompt = SYSTEM_PROMPT
             return True
         except (FileNotFoundError, KeyError, json.JSONDecodeError):
             return False

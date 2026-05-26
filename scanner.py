@@ -24,9 +24,19 @@ TOOL_NAMES = [
     "netexec", "wfuzz", "dirsearch", "sshpass",
 ]
 
+PWNTOOL_NAMES = [
+    "gdb", "r2", "checksec", "ROPgadget", "ropper", "one_gadget",
+    "ltrace", "strace", "objdump", "readelf", "strings", "file",
+    "ghidra",
+]
+
 
 def check_tools() -> dict[str, bool]:
     return {t: shutil.which(t) is not None for t in TOOL_NAMES}
+
+
+def check_pwn_tools() -> dict[str, bool]:
+    return {t: shutil.which(t) is not None for t in PWNTOOL_NAMES}
 
 
 # ── Command execution ──────────────────────────────────────
@@ -316,6 +326,271 @@ def format_result(result: dict, max_chars: int = 4000) -> str:
         half = max_chars // 2
         combined = combined[:half] + f"\n\n[…{len(combined) - max_chars:,} chars omitted…]\n\n" + combined[-half:]
     return f"$ {cmd}\n{combined}"
+
+
+# ── Binary analysis / RE / Pwn ────────────────────────────
+
+def analyze_binary(path: str) -> dict:
+    """Full static survey: file type, protections, ELF headers, interesting strings."""
+    if not Path(path).exists():
+        return {"command": "", "stdout": f"File not found: {path}", "stderr": "", "returncode": -1, "success": False}
+
+    parts: list[str] = []
+
+    # file
+    r = run_command(f"file '{path}'", timeout=10)
+    parts.append(f"=== file ===\n{(r['stdout'] or r['stderr']).strip()}")
+
+    # checksec
+    if shutil.which("checksec"):
+        r = run_command(f"checksec --file='{path}'", timeout=15)
+        parts.append(f"\n=== checksec ===\n{(r['stdout'] or r['stderr']).strip()}")
+    else:
+        # Manual fallback using readelf
+        r = run_command(f"readelf -l '{path}' 2>/dev/null | grep -E 'GNU_STACK|GNU_RELRO'", timeout=10)
+        parts.append(f"\n=== protections (readelf fallback) ===\n{(r['stdout'] or r['stderr']).strip()}")
+
+    # ELF headers
+    r = run_command(f"readelf -h '{path}' 2>/dev/null", timeout=10)
+    parts.append(f"\n=== readelf -h ===\n{(r['stdout'] or r['stderr']).strip()}")
+
+    # Sections
+    r = run_command(f"readelf -S '{path}' 2>/dev/null | head -40", timeout=10)
+    parts.append(f"\n=== sections ===\n{(r['stdout'] or r['stderr']).strip()}")
+
+    # Dynamic imports
+    r = run_command(f"readelf -d '{path}' 2>/dev/null | grep -E 'NEEDED|RPATH|RUNPATH'", timeout=10)
+    parts.append(f"\n=== dynamic deps ===\n{(r['stdout'] or r['stderr']).strip()}")
+
+    # Symbol table (functions)
+    r = run_command(f"nm -D '{path}' 2>/dev/null || nm '{path}' 2>/dev/null | grep -E ' [Tt] | [Uu] '", timeout=10)
+    sym_out = (r["stdout"] or r["stderr"]).strip()
+    if len(sym_out) > 2000:
+        sym_out = sym_out[:2000] + "\n[… truncated …]"
+    parts.append(f"\n=== symbols ===\n{sym_out}")
+
+    # Interesting strings
+    r = run_command(
+        f"strings -n 8 '{path}' | grep -iE "
+        r"""'(flag|pass|password|secret|key|token|admin|root|sh|bin/sh|/bin/bash|http|win|system|exec|printf|gets|read|fgets|scanf|strcpy|strcat|sprintf|popen)'""",
+        timeout=15,
+    )
+    str_out = (r["stdout"] or r["stderr"]).strip()
+    if len(str_out) > 1500:
+        str_out = str_out[:1500] + "\n[… truncated …]"
+    parts.append(f"\n=== interesting strings ===\n{str_out}")
+
+    combined = "\n".join(parts)
+    return {
+        "command": f"analyze_binary {path}",
+        "stdout": combined,
+        "stderr": "",
+        "returncode": 0,
+        "success": True,
+    }
+
+
+def disassemble(binary: str, target: str = "main", count: int = 100) -> dict:
+    """Disassemble a function or address using r2 (preferred) or objdump fallback."""
+    if not Path(binary).exists():
+        return {"command": "", "stdout": f"File not found: {binary}", "stderr": "", "returncode": -1, "success": False}
+
+    if shutil.which("r2"):
+        # r2 batch mode: analyse all, print disassembly of target function/address
+        if target.startswith("0x") or target.lstrip("-").isdigit():
+            cmd = f"r2 -A -q -c 'pd {count} @ {target}' '{binary}' 2>/dev/null"
+        else:
+            cmd = f"r2 -A -q -c 'pdf @ sym.{target} 2>/dev/null || pdf @ {target} 2>/dev/null' '{binary}' 2>/dev/null"
+        r = run_command(cmd, timeout=60)
+        out = (r["stdout"] or r["stderr"]).strip()
+        if out:
+            return {**r, "command": cmd}
+
+    # objdump fallback
+    if shutil.which("objdump"):
+        cmd = f"objdump -M intel -d '{binary}' 2>/dev/null | grep -A {count} '<{target}>:'"
+        return run_command(cmd, timeout=30)
+
+    return {"command": "", "stdout": "r2 and objdump not found", "stderr": "", "returncode": -1, "success": False}
+
+
+def run_r2(binary: str, commands: str, timeout: int = 60) -> dict:
+    """Execute radare2 in batch mode with arbitrary commands.
+
+    commands is a semicolon-separated string, e.g. 'aaa; afl; pdf @ main'
+    """
+    if not shutil.which("r2"):
+        return {"command": "", "stdout": "radare2 (r2) not installed", "stderr": "", "returncode": -1, "success": False}
+    if not Path(binary).exists():
+        return {"command": "", "stdout": f"File not found: {binary}", "stderr": "", "returncode": -1, "success": False}
+    # Build -c args from semicolon list
+    cmds = [c.strip() for c in commands.split(";") if c.strip()]
+    c_args = " ".join(f"-c '{c}'" for c in cmds)
+    cmd = f"r2 -A -q {c_args} '{binary}' 2>/dev/null"
+    return run_command(cmd, timeout=timeout)
+
+
+def find_gadgets(binary: str, filter_str: str = "", tool: str = "auto") -> dict:
+    """Find ROP gadgets using ROPgadget or ropper (auto-selects best available)."""
+    if not Path(binary).exists():
+        return {"command": "", "stdout": f"File not found: {binary}", "stderr": "", "returncode": -1, "success": False}
+
+    has_rop = shutil.which("ROPgadget")
+    has_ropper = shutil.which("ropper")
+
+    if tool == "auto":
+        tool = "ROPgadget" if has_rop else ("ropper" if has_ropper else "none")
+
+    if tool == "ROPgadget" and has_rop:
+        cmd = f"ROPgadget --binary '{binary}'"
+        if filter_str:
+            cmd += f" | grep -iE '{filter_str}'"
+        return run_command(cmd, timeout=120)
+
+    if tool == "ropper" and has_ropper:
+        cmd = f"ropper -f '{binary}'"
+        if filter_str:
+            cmd += f" --search '{filter_str}'"
+        return run_command(cmd, timeout=120)
+
+    return {
+        "command": "", "stdout": "Neither ROPgadget nor ropper found",
+        "stderr": "", "returncode": -1, "success": False,
+    }
+
+
+def find_one_gadget(libc_path: str) -> dict:
+    """Find one-gadget RCE addresses in a libc binary using one_gadget."""
+    if not shutil.which("one_gadget"):
+        return {"command": "", "stdout": "one_gadget not installed (gem install one_gadget)", "stderr": "", "returncode": -1, "success": False}
+    if not Path(libc_path).exists():
+        return {"command": "", "stdout": f"File not found: {libc_path}", "stderr": "", "returncode": -1, "success": False}
+    return run_command(f"one_gadget '{libc_path}'", timeout=60)
+
+
+def trace_binary(binary: str, args: str = "", tool: str = "auto", timeout: int = 30) -> dict:
+    """Run binary under ltrace (library calls) or strace (syscalls)."""
+    if not Path(binary).exists():
+        return {"command": "", "stdout": f"File not found: {binary}", "stderr": "", "returncode": -1, "success": False}
+
+    if tool == "auto":
+        tool = "ltrace" if shutil.which("ltrace") else ("strace" if shutil.which("strace") else "none")
+
+    if tool == "ltrace" and shutil.which("ltrace"):
+        cmd = f"ltrace -s 256 '{binary}' {args} 2>&1"
+    elif tool == "strace" and shutil.which("strace"):
+        cmd = f"strace -s 256 '{binary}' {args} 2>&1"
+    elif tool == "strace":
+        cmd = f"strace -s 256 '{binary}' {args} 2>&1"
+    else:
+        return {"command": "", "stdout": "ltrace and strace not found", "stderr": "", "returncode": -1, "success": False}
+
+    return run_command(cmd, timeout=timeout)
+
+
+def debug_gdb(binary: str, commands: str, timeout: int = 30) -> dict:
+    """Run GDB in batch mode with a list of commands (newline or semicolon separated).
+
+    Example commands: 'start; x/20wx $rsp; info registers; q'
+    """
+    if not shutil.which("gdb"):
+        return {"command": "", "stdout": "gdb not installed", "stderr": "", "returncode": -1, "success": False}
+    if not Path(binary).exists():
+        return {"command": "", "stdout": f"File not found: {binary}", "stderr": "", "returncode": -1, "success": False}
+
+    cmds = [c.strip() for c in commands.replace(";", "\n").splitlines() if c.strip()]
+    ex_args = " ".join(f'-ex "{c}"' for c in cmds)
+    cmd = f"gdb -q -batch {ex_args} '{binary}' 2>&1"
+    return run_command(cmd, timeout=timeout)
+
+
+def cyclic_pattern(length: int = 200, find: str = "") -> dict:
+    """Generate or search a de Bruijn cyclic pattern using pwntools.
+
+    If find is set (e.g. '0x6161616c'), returns the offset.
+    """
+    if find:
+        script = f"from pwn import *; print(cyclic_find({find}))"
+    else:
+        script = f"from pwn import *; print(cyclic({length}).decode())"
+    try:
+        r = subprocess.run(
+            ["python", "-c", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        return {
+            "command": script, "stdout": r.stdout.strip(),
+            "stderr": r.stderr.strip(), "returncode": r.returncode,
+            "success": r.returncode == 0,
+        }
+    except Exception as exc:
+        return {"command": script, "stdout": "", "stderr": str(exc), "returncode": -1, "success": False}
+
+
+def decompile_func(binary: str, function: str = "main", ghidra_dir: str = "/opt/ghidra") -> dict:
+    """Decompile a function using Ghidra headless analyzer.
+
+    Requires Ghidra installed (ghidraRun / analyzeHeadless in PATH or ghidra_dir).
+    """
+    headless = shutil.which("analyzeHeadless")
+    if not headless:
+        headless_candidates = [
+            f"{ghidra_dir}/support/analyzeHeadless",
+            "/usr/share/ghidra/support/analyzeHeadless",
+        ]
+        for c in headless_candidates:
+            if Path(c).exists():
+                headless = c
+                break
+
+    if not headless:
+        return {
+            "command": "", "stdout": "Ghidra headless analyzer not found. Install Ghidra and ensure analyzeHeadless is in PATH.",
+            "stderr": "", "returncode": -1, "success": False,
+        }
+
+    if not Path(binary).exists():
+        return {"command": "", "stdout": f"File not found: {binary}", "stderr": "", "returncode": -1, "success": False}
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        proj = Path(tmpdir) / "proj"
+        # Use Ghidra's built-in DecompileFunction script if available
+        script_content = f"""\
+import ghidra.app.decompiler.DecompInterface as DecompInterface
+from ghidra.util.task import ConsoleTaskMonitor
+
+ifc = DecompInterface()
+ifc.openProgram(currentProgram)
+monitor = ConsoleTaskMonitor()
+funcs = [f for f in currentProgram.getFunctionManager().getFunctions(True) if '{function}' in f.getName()]
+if funcs:
+    res = ifc.decompileFunction(funcs[0], 120, monitor)
+    if res.decompileCompleted():
+        print(res.getDecompiledFunction().getC())
+    else:
+        print('Decompilation failed: ' + res.getErrorMessage())
+else:
+    print('Function not found: {function}')
+"""
+        script_path = Path(tmpdir) / "DecompFunc.py"
+        script_path.write_text(script_content)
+
+        cmd = (
+            f"'{headless}' '{proj}' cyberrag_proj "
+            f"-import '{binary}' "
+            f"-postScript '{script_path}' "
+            f"-scriptlog '{tmpdir}/script.log' "
+            f"-deleteProject 2>&1"
+        )
+        r = run_command(cmd, timeout=180)
+        # Pull decompiled output from script log if stdout is empty
+        script_log = Path(tmpdir) / "script.log"
+        if script_log.exists():
+            log_content = script_log.read_text()
+            if log_content.strip():
+                r = {**r, "stdout": log_content}
+        return r
 
 
 # ── Dangerous command detection ────────────────────────────

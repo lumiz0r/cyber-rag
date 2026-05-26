@@ -86,11 +86,12 @@ def print_menu():
     table.add_column(style=C_DIM)
 
     table.add_row("[1]", "MACHINE MODE",  "Start solving a HackTheBox machine")
-    table.add_row("[2]", "QUERY MODE",    "Ask the AI anything (RAG-assisted)")
-    table.add_row("[3]", "SYNC NOTION",   "Fetch & index Notion notes")
-    table.add_row("[4]", "KB STATUS",     "Knowledge base statistics")
-    table.add_row("[5]", "TOOLS STATUS",  "Check installed pentesting tools")
-    table.add_row("[6]", "SETTINGS",      "View/update configuration")
+    table.add_row("[2]", "BINARY MODE",   "Reverse engineering & binary exploitation")
+    table.add_row("[3]", "QUERY MODE",    "Ask the AI anything (RAG-assisted)")
+    table.add_row("[4]", "SYNC NOTION",   "Fetch & index Notion notes")
+    table.add_row("[5]", "KB STATUS",     "Knowledge base statistics")
+    table.add_row("[6]", "TOOLS STATUS",  "Check installed pentesting tools")
+    table.add_row("[7]", "SETTINGS",      "View/update configuration")
     table.add_row("[0]", "EXIT",          "Disconnect")
 
     console.print(Panel(
@@ -127,6 +128,16 @@ def on_tool_start(name: str, inp: dict):
         "get_credentials":  "[CRED]",
         "nikto_scan":       "[NIKTO]",
         "privesc_enum":     "[PRIVESC]",
+        # RE / pwn
+        "analyze_binary":   "[BIN]",
+        "disassemble":      "[ASM]",
+        "run_r2":           "[R2]",
+        "find_gadgets":     "[ROP]",
+        "find_one_gadget":  "[1GADGET]",
+        "trace_binary":     "[TRACE]",
+        "debug_gdb":        "[GDB]",
+        "cyclic_pattern":   "[CYCLIC]",
+        "decompile_func":   "[GHIDRA]",
     }
     icon = icons.get(name, "[???]")
     detail = ""
@@ -148,6 +159,26 @@ def on_tool_start(name: str, inp: dict):
         detail = f": {inp.get('ip', '')}  {' '.join(inp.get('hostnames', []))}"
     elif name == "store_credential":
         detail = f": {inp.get('username', '')} / {inp.get('secret', '')[:20]}… [{inp.get('service', '?')}]"
+    elif name == "analyze_binary":
+        detail = f": {inp.get('path', '')}"
+    elif name in ("disassemble", "run_r2", "find_gadgets", "find_one_gadget",
+                  "trace_binary", "debug_gdb", "decompile_func"):
+        detail = f": {inp.get('binary', inp.get('libc_path', ''))}"
+        if name == "disassemble":
+            detail += f" @ {inp.get('target', 'main')}"
+        elif name == "run_r2":
+            detail += f" — {inp.get('commands', '')[:60]}"
+        elif name == "find_gadgets" and inp.get("filter_str"):
+            detail += f" | grep '{inp['filter_str']}'"
+        elif name == "debug_gdb":
+            detail += f" — {inp.get('commands', '')[:60]}"
+        elif name == "decompile_func":
+            detail += f" @ {inp.get('function', 'main')}"
+    elif name == "cyclic_pattern":
+        if inp.get("find"):
+            detail = f": find {inp['find']}"
+        else:
+            detail = f": len={inp.get('length', 200)}"
     console.print(f"\n  [{C_SECONDARY}]{icon} {name}{detail}[/{C_SECONDARY}]")
 
     # Start a heartbeat thread — prints elapsed time every 15s after an 8s grace period
@@ -485,6 +516,161 @@ def machine_mode(agent: CyberAgent):
 
 
 # ──────────────────────────────────────────────────────────────
+# Mode: Binary exploitation / RE
+# ──────────────────────────────────────────────────────────────
+
+def binary_mode(agent: CyberAgent):
+    console.print(Panel(
+        f"[{C_PRIMARY}]BINARY MODE[/{C_PRIMARY}]\n"
+        f"[{C_DIM}]Reverse engineering & binary exploitation — radare2, GDB/pwndbg, pwntools, ROPgadget[/{C_DIM}]",
+        border_style="bright_cyan",
+    ))
+
+    binary_path = Prompt.ask(f"[{C_PRIMARY}]Path to binary[/{C_PRIMARY}]")
+    if not Path(binary_path).exists():
+        console.print(f"[{C_ERROR}]✗ File not found: {binary_path}[/{C_ERROR}]")
+        return
+
+    challenge_name = Prompt.ask(
+        f"[{C_PRIMARY}]Challenge name[/{C_PRIMARY}] [{C_DIM}](optional, defaults to filename)[/{C_DIM}]",
+        default=Path(binary_path).stem,
+    )
+    libc_path = Prompt.ask(
+        f"[{C_PRIMARY}]libc path[/{C_PRIMARY}] [{C_DIM}](optional)[/{C_DIM}]",
+        default="",
+    )
+    remote_host = Prompt.ask(
+        f"[{C_PRIMARY}]Remote host[/{C_PRIMARY}] [{C_DIM}](optional, e.g. pwn.htb)[/{C_DIM}]",
+        default="",
+    )
+    remote_port_str = ""
+    if remote_host:
+        remote_port_str = Prompt.ask(f"[{C_PRIMARY}]Remote port[/{C_PRIMARY}]", default="")
+
+    diff_table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+    diff_table.add_column(style=C_PRIMARY, width=5)
+    diff_table.add_column(style=C_WHITE, width=10)
+    diff_table.add_column(style=C_DIM)
+    diff_table.add_row("[1]", "EASY",   "No PIE, no canary — ret2win / simple ROP")
+    diff_table.add_row("[2]", "MEDIUM", "Partial protections — ret2libc / one_gadget")
+    diff_table.add_row("[3]", "HARD",   "Full protections — heap / format string / ROP chains")
+    diff_table.add_row("[4]", "INSANE", "Kernel / FSOP / sandbox escape / custom allocator")
+    console.print(Panel(
+        diff_table,
+        title=f"[{C_PRIMARY}]▶  DIFFICULTY[/{C_PRIMARY}]",
+        border_style="bright_cyan",
+        padding=(0, 1),
+    ))
+    diff_choice = Prompt.ask(f"[{C_PRIMARY}]Difficulty[/{C_PRIMARY}]", choices=["1", "2", "3", "4"], default="2")
+    difficulty  = {"1": "Easy", "2": "Medium", "3": "Hard", "4": "Insane"}[diff_choice]
+
+    session_path = str(SESSION_DIR / f"pwn_{challenge_name.lower()}.json")
+    agent.session_save_cb = lambda: agent.save_session(session_path)
+
+    # ── Session resume ──────────────────────────────────────
+    resumed = False
+    if Path(session_path).exists():
+        console.print(f"\n[{C_WARN}]▶ Existing session found for {challenge_name}[/{C_WARN}]")
+        if Confirm.ask(f"[{C_PRIMARY}]Resume previous session?[/{C_PRIMARY}]", default=True):
+            if agent.load_session(session_path):
+                console.print(f"[{C_SUCCESS}]✓ Session resumed — {len(agent.history)} messages[/{C_SUCCESS}]")
+                resumed = True
+            else:
+                console.print(f"[{C_ERROR}]✗ Failed to load session — starting fresh[/{C_ERROR}]")
+
+    if not resumed:
+        console.print(f"\n[{C_WARN}]▶ ANALYZING: {challenge_name}[/{C_WARN}]")
+        console.print(f"[{C_DIM}]Running initial analysis — this may take a moment…[/{C_DIM}]\n")
+        try:
+            remote_port = int(remote_port_str) if remote_port_str.strip().isdigit() else 0
+            response = agent.start_binary(
+                binary_path=binary_path,
+                challenge_name=challenge_name,
+                remote_host=remote_host,
+                remote_port=remote_port,
+                difficulty=difficulty,
+                libc_path=libc_path or "",
+            )
+        except Exception as exc:
+            agent.save_session(session_path)
+            console.print(f"[{C_ERROR}]✗ Error during analysis — session saved → {session_path}[/{C_ERROR}]")
+            console.print(f"[{C_DIM}]{markup_escape(str(exc))}[/{C_DIM}]")
+            return
+        display_response(response, f"◈ {challenge_name}")
+        agent.save_session(session_path)
+
+    # ── Interactive prompt ─────────────────────────────────
+    console.print()
+    console.print(Panel(
+        f"[{C_SUCCESS}]ANALYSIS COMPLETE[/{C_SUCCESS}]  ·  [{C_DIM}]exploit → verify → pwn[/{C_DIM}]\n"
+        f"[{C_DIM}]Commands: [bold]context[/bold]  ·  [bold]think <msg>[/bold]  ·  "
+        f"[bold]img:<path> <msg>[/bold]  ·  [bold]reset[/bold]  ·  [bold]back[/bold][/{C_DIM}]",
+        border_style="bright_green",
+        padding=(0, 2),
+    ))
+
+    while True:
+        try:
+            raw = Prompt.ask(f"[{C_PRIMARY}]PWN/{challenge_name}[/{C_PRIMARY}][{C_SECONDARY}] ▶[/{C_SECONDARY}]")
+        except KeyboardInterrupt:
+            agent.save_session(session_path)
+            break
+
+        if raw.lower() in ("back", "exit", "quit", "q", ""):
+            agent.save_session(session_path)
+            console.print(f"[{C_DIM}]Session saved → {session_path}[/{C_DIM}]")
+            break
+
+        if raw.lower() == "reset":
+            agent.reset()
+            Path(session_path).unlink(missing_ok=True)
+            console.print(f"[{C_SUCCESS}]✓ Session reset[/{C_SUCCESS}]")
+            continue
+
+        if raw.lower() == "context":
+            ctx = agent.binary_context
+            if not ctx:
+                console.print(f"[{C_DIM}]No binary context yet — run analysis first.[/{C_DIM}]")
+            else:
+                ctx_table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+                ctx_table.add_column(style=C_PRIMARY, width=18)
+                ctx_table.add_column(style=C_WHITE)
+                ctx_table.add_row("Binary:", ctx.get("path", ""))
+                ctx_table.add_row("Arch:", ctx.get("arch", "unknown"))
+                prot = ctx.get("protections", {})
+                ctx_table.add_row("Protections:", "  ".join(f"{k}={v}" for k, v in prot.items()) or "unknown")
+                if ctx.get("remote"):
+                    ctx_table.add_row("Remote:", f"{ctx['remote'][0]}:{ctx['remote'][1]}")
+                if ctx.get("libc"):
+                    ctx_table.add_row("libc:", ctx["libc"])
+                if ctx.get("offset"):
+                    ctx_table.add_row("BOF offset:", str(ctx["offset"]))
+                console.print(Panel(
+                    ctx_table,
+                    title=f"[{C_PRIMARY}]◈ BINARY CONTEXT[/{C_PRIMARY}]",
+                    border_style="bright_cyan",
+                ))
+            continue
+
+        use_thinking = False
+        if raw.lower().startswith("think "):
+            raw = raw[6:].strip()
+            use_thinking = True
+            console.print(f"[{C_WARN}]▶ Extended thinking enabled[/{C_WARN}]")
+
+        img, text = get_image_path(raw)
+        console.print(f"[{C_DIM}]─────────────────────────────────────────[/{C_DIM}]")
+        try:
+            streamed_chat(agent, text, image_path=img, title=f"◈ {challenge_name}", use_thinking=use_thinking)
+        except Exception as exc:
+            agent.save_session(session_path)
+            console.print(f"[{C_ERROR}]✗ Error — session saved[/{C_ERROR}]")
+            console.print(f"[{C_DIM}]{markup_escape(str(exc))}[/{C_DIM}]")
+            continue
+        agent.save_session(session_path)
+
+
+# ──────────────────────────────────────────────────────────────
 # Mode: Direct query
 # ──────────────────────────────────────────────────────────────
 
@@ -616,16 +802,21 @@ def show_kb_status(rag: RAGEngine):
 # ──────────────────────────────────────────────────────────────
 
 def show_tools():
-    tools = check_tools()
-    table = Table(box=box.SIMPLE, padding=(0, 2))
-    table.add_column("TOOL", style=C_PRIMARY, width=18)
-    table.add_column("STATUS", width=16)
+    from scanner import check_pwn_tools
+    pen_tools = check_tools()
+    pwn_tools = check_pwn_tools()
 
-    for tool, avail in sorted(tools.items()):
-        status = f"[{C_SUCCESS}]● AVAILABLE[/{C_SUCCESS}]" if avail else f"[{C_ERROR}]○ NOT FOUND[/{C_ERROR}]"
-        table.add_row(tool.upper(), status)
+    def _tool_table(title: str, tools: dict) -> Panel:
+        table = Table(box=box.SIMPLE, padding=(0, 2), show_header=False)
+        table.add_column(style=C_PRIMARY, width=18)
+        table.add_column(width=16)
+        for tool, avail in sorted(tools.items()):
+            status = f"[{C_SUCCESS}]● AVAILABLE[/{C_SUCCESS}]" if avail else f"[{C_ERROR}]○ NOT FOUND[/{C_ERROR}]"
+            table.add_row(tool, status)
+        return Panel(table, title=f"[{C_PRIMARY}]{title}[/{C_PRIMARY}]", border_style="bright_cyan")
 
-    console.print(Panel(table, title=f"[{C_PRIMARY}]◈ TOOLS STATUS[/{C_PRIMARY}]", border_style="bright_cyan"))
+    console.print(_tool_table("◈ PENTESTING TOOLS", pen_tools))
+    console.print(_tool_table("◈ RE / PWN TOOLS", pwn_tools))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -705,7 +896,7 @@ def main():
             print_menu()
             choice = Prompt.ask(
                 f"[{C_PRIMARY}]SELECT[/{C_PRIMARY}][{C_SECONDARY}] ▶[/{C_SECONDARY}]",
-                choices=["0", "1", "2", "3", "4", "5", "6"],
+                choices=["0", "1", "2", "3", "4", "5", "6", "7"],
                 show_choices=False,
             )
             console.print()
@@ -716,14 +907,16 @@ def main():
             elif choice == "1":
                 machine_mode(agent)
             elif choice == "2":
-                query_mode(agent)
+                binary_mode(agent)
             elif choice == "3":
-                sync_notion(config, rag)
+                query_mode(agent)
             elif choice == "4":
-                show_kb_status(rag)
+                sync_notion(config, rag)
             elif choice == "5":
-                show_tools()
+                show_kb_status(rag)
             elif choice == "6":
+                show_tools()
+            elif choice == "7":
                 show_settings(config)
 
             console.print()
