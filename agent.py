@@ -1515,6 +1515,43 @@ class CyberAgent:
 
     # ── Session persistence ────────────────────────────────
 
+    @staticmethod
+    def _sanitize_block(block: dict) -> dict:
+        """Keep only the fields the API accepts in request messages.
+
+        The Anthropic SDK returns extra fields on response content blocks
+        (e.g. citations, parsed_output, caller) that are *not* accepted when
+        those blocks are echoed back in subsequent API requests.  This strips
+        them down to the minimal valid shape for each block type.
+        """
+        btype = block.get("type", "")
+        if btype == "text":
+            return {"type": "text", "text": block.get("text", "")}
+        if btype == "tool_use":
+            return {
+                "type":  "tool_use",
+                "id":    block.get("id", ""),
+                "name":  block.get("name", ""),
+                "input": block.get("input", {}),
+            }
+        if btype == "tool_result":
+            sanitized: dict = {
+                "type":        "tool_result",
+                "tool_use_id": block.get("tool_use_id", ""),
+                "content":     block.get("content", ""),
+            }
+            if "is_error" in block:
+                sanitized["is_error"] = block["is_error"]
+            return sanitized
+        if btype == "thinking":
+            return {
+                "type":      "thinking",
+                "thinking":  block.get("thinking", ""),
+                "signature": block.get("signature", ""),
+            }
+        # image / document / unknown — return as-is
+        return block
+
     def _serialize_history(self) -> list[dict]:
         result = []
         for msg in self.history:
@@ -1523,11 +1560,12 @@ class CyberAgent:
                 serialized = []
                 for block in content:
                     if hasattr(block, "model_dump"):
-                        serialized.append(block.model_dump())
+                        d = block.model_dump()
                     elif isinstance(block, dict):
-                        serialized.append(block)
+                        d = block
                     else:
-                        serialized.append({"type": "text", "text": str(block)})
+                        d = {"type": "text", "text": str(block)}
+                    serialized.append(self._sanitize_block(d))
                 result.append({"role": msg["role"], "content": serialized})
             else:
                 result.append(msg)
@@ -1558,7 +1596,15 @@ class CyberAgent:
         try:
             with open(path) as f:
                 data = json.load(f)
-            self.history = data["history"]
+            # Sanitize any blocks that were saved with extra API-response fields
+            raw_history = data["history"]
+            clean_history = []
+            for msg in raw_history:
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    content = [self._sanitize_block(b) if isinstance(b, dict) else b for b in content]
+                clean_history.append({"role": msg["role"], "content": content})
+            self.history = clean_history
             self.machine_context = data["machine_context"]
             self.binary_context  = data.get("binary_context", {})
             self.credentials = data.get("credentials", [])
